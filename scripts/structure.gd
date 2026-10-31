@@ -6,6 +6,8 @@ extends Node2D
 ## Physics: a rigid body on springy ground,
 ##   I*theta'' = M*cos(theta) + Wh*sin(theta) - k*theta - c*theta' + external
 ## where M = sum(m*x) is the off-centre load and Wh = sum(m*y) the P-delta term.
+## The ground also creeps: a leaning structure sinks further the longer it leans,
+## and "settle" is a steady sag in one direction, so standing still loses.
 ## Coordinates are pixels from the pivot, x right, y up.
 
 const VW := 200
@@ -13,13 +15,17 @@ const VH := 240
 const CX := 100
 const BY := 222
 const BODY_M := 100.0
-const BODY_H := {"campanile": 62.0, "watertower": 45.0, "crane": 60.0, "barge": 30.0}
-const TOP := {"campanile": Vector2(0, 144), "watertower": Vector2(0, 118), "crane": Vector2(0, 146), "barge": Vector2(8, 108)}
-const FOOT := {"campanile": 22.0, "watertower": 28.0, "crane": 16.0, "barge": 46.0}
-const BRIDGE := {"campanile": Vector2(22, 100), "watertower": Vector2(34, 86)}
+const BODY_H := {"campanile": 62.0, "watertower": 45.0, "crane": 60.0, "barge": 30.0, "clock": 62.0, "pier": 58.0, "mast": 70.0}
+const TOP := {"campanile": Vector2(0, 144), "watertower": Vector2(0, 118), "crane": Vector2(0, 146), "barge": Vector2(8, 108), "clock": Vector2(0, 166), "pier": Vector2(0, 122), "mast": Vector2(0, 190)}
+const BRIDGE := {"campanile": Vector2(22, 100), "watertower": Vector2(34, 86), "crane": Vector2(6, 100), "clock": Vector2(21, 100)}
 const PENDULUM_G := 400.0
-const PUMP_RATE := 8.0
+const PUMP_RATE := 5.0
 const PIPE_TIME := 0.7
+## Heavy things move slowly: an item slides at RATE_K / mass pixels per second.
+const RATE_K := 110.0
+const MIN_RATE := 4.0
+const DECK_HW := 94.0
+const WINCH_LAG := 0.18
 
 var type := "campanile"
 var items: Array = []
@@ -33,6 +39,9 @@ var inertia := 1.0
 var body_x := 0.0
 var body_h := 60.0
 var ext_torque := 0.0
+var creep := 0.0
+var creep_rate := 0.0
+var settle := 0.0
 var wave_amp := 0.0
 var pumping := -1
 var hover_item := -1
@@ -46,22 +55,16 @@ func setup(def: Dictionary) -> void:
 	var ans_moment := 0.0
 	var wh := BODY_M * body_h
 	for src in def["items"]:
-		var it: Dictionary = src.duplicate(true)
-		for key in ["x", "y", "m", "ans", "min", "max", "cap", "level", "len", "phi", "damp"]:
-			if it.has(key):
-				it[key] = float(it[key])
+		var it := _prepare(src)
 		match it["kind"]:
 			"tank":
-				it["pipe"] = 0.0
-				it["slosh"] = 0.0
-				it["slosh_v"] = 0.0
-				it["inflow"] = 0.0
 				ans_moment += it["ans"] * it["x"]
 				wh += it["level"] * it["y"]
 			"load":
-				it["phi_v"] = 0.0
 				ans_moment += it["m"] * it["x"]
 				wh += it["m"] * it["y"]
+			"winch":
+				pass
 			_:
 				ans_moment += it["m"] * it["ans"]
 				wh += it["m"] * it["y"]
@@ -73,17 +76,110 @@ func setup(def: Dictionary) -> void:
 	var w := TAU / float(def.get("period", 2.2))
 	inertia = stiff / (w * w)
 	c = 2.0 * float(def.get("zeta", 0.5)) * sqrt(inertia * stiff)
-	theta = _equilibrium()
+	if def.has("unstable"):
+		# The ground pushes it over instead of back up: it must be balanced by hand.
+		k = wh - stiff * float(def["unstable"])
+		theta = deg_to_rad(float(def.get("lean", 1.0)))
+	else:
+		theta = _equilibrium()
 	omega = 0.0
 	queue_redraw()
 
 
+func _prepare(src: Dictionary) -> Dictionary:
+	var it: Dictionary = src.duplicate(true)
+	for key in ["x", "y", "m", "ans", "min", "max", "cap", "level", "len", "phi", "damp", "rate", "notch", "side", "force", "speed"]:
+		if it.has(key):
+			it[key] = float(it[key])
+	match it["kind"]:
+		"tank":
+			it["pipe"] = 0.0
+			it["slosh"] = 0.0
+			it["slosh_v"] = 0.0
+			it["inflow"] = 0.0
+			it["leak"] = 0.0
+			it["leak_left"] = 0.0
+		"load":
+			it["phi_v"] = 0.0
+		"winch":
+			it["m"] = 0.0
+			it["spool"] = 0.0
+		"train":
+			pass
+		_:
+			it["tx"] = it["x"]
+			if not it.has("rate"):
+				it["rate"] = maxf(MIN_RATE, RATE_K / float(it["m"]))
+	return it
+
+
+func add_item(def: Dictionary) -> void:
+	items.append(_prepare(def))
+
+
 static func mass_of(it: Dictionary) -> float:
-	return it["level"] if it["kind"] == "tank" else it["m"]
+	match it["kind"]:
+		"tank":
+			return it["level"]
+		"train":
+			# The far abutment carries more of the train the closer it gets, so the
+			# pier feels nothing at either end and the most halfway along each span.
+			return float(it["m"]) * maxf(0.0, 1.0 - absf(float(it["x"])) / DECK_HW)
+	return it["m"]
+
+
+## Is a train still on its way to the deck, or on it?
+func has_trains() -> bool:
+	for it in items:
+		if it["kind"] == "train":
+			if float(it["x"]) * float(it["speed"]) < 0.0 or absf(float(it["x"])) < DECK_HW:
+				return true
+	return false
+
+
+func drop_finished_trains() -> void:
+	for i in range(items.size() - 1, -1, -1):
+		var it: Dictionary = items[i]
+		if it["kind"] == "train" and float(it["x"]) * float(it["speed"]) > 0.0 and absf(float(it["x"])) > 260.0:
+			items.remove_at(i)
+
+
+## A sudden permanent shove of `deg` degrees, with a jolt.
+func kick(dir: float, deg: float) -> void:
+	creep += dir * deg_to_rad(deg) * stiff
+	omega += dir * deg_to_rad(deg) * 1.5
+
+
+## How much moment in direction `dir` the player can still produce by moving things.
+func capacity(dir: float) -> float:
+	var total := 0.0
+	var water := 0.0
+	var now := 0.0
+	var tanks: Array = []
+	for it in items:
+		match it["kind"]:
+			"bell", "crate", "counter":
+				var room: float = float(it["max"]) - float(it["x"]) if dir > 0.0 else float(it["x"]) - float(it["min"])
+				total += float(it["m"]) * room
+			"winch":
+				return INF
+			"tank":
+				water += float(it["level"])
+				now += float(it["level"]) * float(it["x"])
+				tanks.append(it)
+	if tanks.size() > 1:
+		tanks.sort_custom(func(a, b): return float(a["x"]) * dir > float(b["x"]) * dir)
+		var best := 0.0
+		for it in tanks:
+			var put := minf(water, float(it["cap"]))
+			best += put * float(it["x"])
+			water -= put
+		total += (best - now) * dir
+	return total
 
 
 func _moments() -> Vector2:
-	var mx := BODY_M * body_x
+	var mx := BODY_M * body_x + creep
 	var wh := BODY_M * body_h
 	for it in items:
 		var m := mass_of(it)
@@ -95,6 +191,8 @@ func _moments() -> Vector2:
 			"load":
 				# Cable tension pulls the jib tip sideways when the load swings.
 				mx += m * sin(it["phi"]) * it["y"] * 0.35
+			"winch":
+				mx += float(it["side"]) * deg_to_rad(float(it["force"])) * stiff * float(it["spool"])
 		mx += m * x
 		wh += m * it["y"]
 	return Vector2(mx, wh)
@@ -112,8 +210,10 @@ func torque_for_amplitude(amp_rad: float, w: float) -> float:
 	return amp_rad * sqrt(pow(stiff - inertia * w * w, 2.0) + pow(c * w, 2.0))
 
 
-func step(dt: float) -> void:
+func step(dt: float, active: bool) -> void:
 	_update_items(dt)
+	if active:
+		creep += (creep_rate * theta + settle) * stiff * dt
 	var mo := _moments()
 	var tau := mo.x * cos(theta) + mo.y * sin(theta) - k * theta - c * omega + ext_torque
 	alpha = tau / inertia
@@ -123,7 +223,7 @@ func step(dt: float) -> void:
 
 func _update_items(dt: float) -> void:
 	# Pumping: draw water from the other tanks into a pipe feeding the held tank.
-	if pumping >= 0:
+	if pumping >= 0 and items[pumping]["kind"] == "tank":
 		var dst: Dictionary = items[pumping]
 		var available := 0.0
 		for i in items.size():
@@ -136,9 +236,20 @@ func _update_items(dt: float) -> void:
 				if i != pumping and items[i]["kind"] == "tank":
 					items[i]["level"] -= amount * items[i]["level"] / available
 			dst["pipe"] += amount
-	for it in items:
+	for i in items.size():
+		var it: Dictionary = items[i]
 		match it["kind"]:
+			"bell", "crate", "counter":
+				it["x"] = move_toward(float(it["x"]), float(it["tx"]), float(it["rate"]) * dt)
+			"winch":
+				it["spool"] = move_toward(float(it["spool"]), 1.0 if pumping == i else 0.0, dt / WINCH_LAG)
+			"train":
+				it["x"] += float(it["speed"]) * dt
 			"tank":
+				# A leak only ever costs "leak_left" water before it is patched.
+				var lost := minf(minf(float(it["leak"]) * dt, float(it["leak_left"])), float(it["level"]))
+				it["level"] -= lost
+				it["leak_left"] -= lost
 				var flow: float = it["pipe"] * dt / PIPE_TIME
 				it["pipe"] -= flow
 				it["level"] += flow
@@ -173,6 +284,9 @@ func hit_item(local: Vector2) -> int:
 					return i
 			"bell", "crate", "counter":
 				if local.distance_to(item_center(it)) < 9.0:
+					return i
+			"winch":
+				if local.distance_to(item_center(it)) < 14.0:
 					return i
 	return -1
 
@@ -224,6 +338,12 @@ func _draw() -> void:
 			_draw_crane()
 		"barge":
 			_draw_barge()
+		"clock":
+			_draw_clock()
+		"pier":
+			_draw_pier()
+		"mast":
+			_draw_mast()
 	for i in items.size():
 		_draw_item(items[i], i == hover_item)
 
@@ -356,6 +476,54 @@ func _draw_barge() -> void:
 	_r(8, 109, 1, 2, Pal.LIGHT)
 
 
+func _draw_clock() -> void:
+	var hw := 20
+	_cyl(-hw - 2, 2, hw * 2 + 4, 2, -0.1)
+	_cyl(-hw, 148, hw * 2, 146)
+	for y in [36, 76, 112]:
+		_ledge(y, hw + 2)
+	_r(-3, 14, 6, 12, Pal.INK)
+	# Clock face with running hands.
+	var face := _p(0, 132)
+	draw_circle(face, 13.0, Pal.LIGHT)
+	draw_circle(face, 12.0, Pal.INK)
+	for h in 12:
+		var a := h * TAU / 12.0
+		draw_rect(Rect2((face + Vector2(sin(a), -cos(a)) * 10.0).floor(), Vector2.ONE), Pal.PALE)
+	draw_line(face, face + Vector2(sin(anim_t * 0.5), -cos(anim_t * 0.5)) * 8.0, Pal.WHITE)
+	draw_line(face, face + Vector2(sin(anim_t * 0.04), -cos(anim_t * 0.04)) * 5.0, Pal.PALE)
+	# Stepped roof.
+	for row in 9:
+		var w := 22 - row * 2
+		_cyl(-w, 149 + row * 2, w * 2, 2, 0.1)
+
+
+func _draw_pier() -> void:
+	_cyl(-24, 3, 48, 3, -0.1)
+	for y in range(3, 110):
+		var hw := int(round(lerpf(21.0, 15.0, (y - 3.0) / 107.0)))
+		var course := int(y / 8.0) % 2 == 1
+		_cyl(-hw, y + 1, hw * 2, 1, -0.2 if course else 0.0)
+	# Deck and rails.
+	_r(-DECK_HW, 120, DECK_HW * 2.0, 8, Pal.MAIN)
+	_r(-DECK_HW, 120, DECK_HW * 2.0, 1, Pal.PALE)
+	_r(-DECK_HW, 113, DECK_HW * 2.0, 1, Pal.DEEP)
+	for x in range(int(-DECK_HW), int(DECK_HW), 10):
+		_r(x, 118, 1, 5, Pal.DEEP)
+	_r(-DECK_HW, 112, 2, 6, Pal.LIGHT)
+	_r(DECK_HW - 2.0, 112, 2, 6, Pal.LIGHT)
+
+
+func _draw_mast() -> void:
+	_cyl(-14, 4, 28, 4, -0.1)
+	_r(-4, 186, 1, 182, Pal.LIGHT)
+	_r(3, 186, 1, 182, Pal.MID)
+	for y in range(4, 186, 7):
+		draw_line(_p(-4, y), _p(3, y + 7), Pal.MID)
+		draw_line(_p(3, y), _p(-4, y + 7), Pal.DEEP)
+	_r(-2, 190, 4, 4, Pal.WARN if int(anim_t * 2.0) % 2 == 0 else Pal.MID)
+
+
 func _bell(p: Vector2, size: int, col: Color) -> void:
 	# size 0 small, 1 medium, 2 large
 	var w := 3 + size * 2
@@ -371,9 +539,10 @@ func _draw_item(it: Dictionary, lit: bool) -> void:
 	match it["kind"]:
 		"bell":
 			var y: float = it["y"]
-			# Track the bell slides along.
-			for x in range(int(it["min"]), int(it["max"]) + 1, 3):
-				_r(x, y, 1, 1, Pal.PALE if lit else Pal.DEEP)
+			# Track the bell slides along; a notched track only stops at its ticks.
+			var notch := int(it.get("notch", 0.0))
+			for x in range(int(it["min"]), int(it["max"]) + 1, notch if notch > 0 else 3):
+				_r(x, y, 1, 3 if notch > 0 else 1, Pal.PALE if lit else Pal.DEEP)
 			var size := 2 if it["m"] >= 16 else (1 if it["m"] >= 10 else 0)
 			var p := _p(roundf(it["x"]), y)
 			draw_rect(Rect2(p.x, p.y, 1, 2), Pal.LIGHT)
@@ -420,5 +589,16 @@ func _draw_item(it: Dictionary, lit: bool) -> void:
 				draw_rect(Rect2(r.position.x + row * 2, r.position.y - 1 - row, 16 - row * 4, 1), Pal.LIGHT if row % 2 == 0 else Pal.MAIN)
 			if lit:
 				draw_rect(Rect2(r.position.x + 6, r.position.y - 7, 4, 1), Pal.WHITE)
-		"load":
-			pass  # hangs in world space; drawn by the main scene
+		"load", "train":
+			pass  # moves in world space; drawn by the main scene
+		"winch":
+			var x: float = it["x"]
+			var sp: float = it["spool"]
+			draw_line(_p(x, 14), _p(0, 170), Pal.WHITE if sp > 0.1 else Pal.DEEP)
+			var r := Rect2(_p(x - 8, 16), Vector2(16, 14))
+			draw_rect(r, Pal.WHITE if blink else Pal.LIGHT)
+			draw_rect(r.grow(-1), Pal.MID)
+			var a := anim_t * 14.0 * float(it["side"]) if sp > 0.1 else 0.0
+			var hub := r.get_center()
+			draw_circle(hub, 4.0, Pal.INK)
+			draw_line(hub, hub + Vector2(cos(a), sin(a)) * 4.0, Pal.PALE)

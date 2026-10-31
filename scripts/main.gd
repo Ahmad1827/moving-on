@@ -9,10 +9,14 @@ const WATER_Y := 208.0
 const TRAVEL_TIME := 3.4
 const PHYS_DT := 1.0 / 240.0
 const WAVE_W := 2.4
-const DEFAULT_BAND := 0.5
-const DEFAULT_HOLD := 1.2
-const DEFAULT_FAIL := 14.0
-const MAP_NODES := [Vector2(70, 186), Vector2(150, 120), Vector2(240, 168), Vector2(330, 108), Vector2(412, 172)]
+const DEFAULT_BAND := 0.3
+const DEFAULT_HOLD := 3.0
+const DEFAULT_FAIL := 9.0
+const DEFAULT_CREEP := 0.08
+const DEFAULT_STILL := 0.8
+const GUST_K := 0.016
+const OUT_OF_MOVES_WAIT := 3.0
+const MAP_NODES := [Vector2(40, 180), Vector2(88, 112), Vector2(140, 178), Vector2(190, 96), Vector2(240, 166), Vector2(290, 92), Vector2(340, 172), Vector2(392, 104), Vector2(440, 176)]
 const SAVE_PATH := "user://progress.cfg"
 
 
@@ -36,6 +40,11 @@ var pivots: Array = []
 var bridge_rest := 0.0
 
 var hold := 0.0
+var stage := 0
+var moves_left := -1
+var out_of_moves_t := 0.0
+var timers: Array = []
+var progress: Array = []
 var level_t := 0.0
 var phys_acc := 0.0
 var drag := {}
@@ -188,11 +197,19 @@ func _build_level(t: int, l: int) -> void:
 		sprites.append(sp)
 		vports.append(vp)
 		pivots.append(Vector2(float(def["x"]), WATER_Y if st.type == "barge" else GROUND_Y))
+		st.creep_rate = float(level.get("creep", DEFAULT_CREEP))
+		st.settle = deg_to_rad(float(level.get("settle", 0.0))) * _sag_direction(st)
 		if level.has("waves"):
 			st.wave_amp = st.torque_for_amplitude(deg_to_rad(float(level["waves"])), WAVE_W)
 	if structs.size() == 2:
 		bridge_rest = _bridge_ends()[0].distance_to(_bridge_ends()[1])
 	hold = 0.0
+	stage = 0
+	moves_left = int(level.get("moves", -1))
+	out_of_moves_t = 0.0
+	timers.clear()
+	for ev in level.get("timed", []):
+		timers.append(float(ev["every"]))
 	level_t = 0.0
 	phys_acc = 0.0
 	drag = {}
@@ -211,9 +228,15 @@ func _restart() -> void:
 	state = State.PLAY
 
 
+## The level to pick a town back up at; a finished town starts over.
+func _resume_level(t: int) -> int:
+	var reached: int = progress[t]
+	return 0 if reached >= Towns.TOWNS[t]["levels"].size() else reached
+
+
 func _go_to_town(t: int) -> void:
 	if t == town_i:
-		_build_level(t, 0)
+		_build_level(t, _resume_level(t))
 		_show_structures(true)
 		state = State.CARD
 	else:
@@ -227,12 +250,12 @@ func _go_to_town(t: int) -> void:
 func _clear() -> void:
 	state = State.CLEAR
 	clear_t = 0.0
-	drag = {}
-	_end_pump()
+	_release()
 	var levels: Array = Towns.TOWNS[town_i]["levels"]
-	if level_i == levels.size() - 1 and unlocked < town_i + 2:
-		unlocked = mini(town_i + 2, Towns.TOWNS.size())
-		_save_progress()
+	progress[town_i] = maxi(int(progress[town_i]), level_i + 1)
+	if level_i == levels.size() - 1:
+		unlocked = maxi(unlocked, mini(town_i + 2, Towns.TOWNS.size()))
+	_save_progress()
 	for i in structs.size():
 		var top := _world_point(i, Structure.TOP[structs[i].type])
 		for _j in 40:
@@ -261,8 +284,81 @@ func _fail(i: int) -> void:
 	collapse_i = i
 	collapse_t = 0.0
 	landed = false
-	drag = {}
-	_end_pump()
+	_release()
+
+
+## Completing a hold sets off the level's next event; after the last, it is cleared.
+func _next_stage() -> void:
+	var events: Array = level.get("events", [])
+	if stage >= events.size():
+		_clear()
+		return
+	_fire(events[stage])
+	stage += 1
+	hold = 0.0
+	# The ground starts sagging a new way each stage, if it sags at all.
+	var sag := deg_to_rad(float(level.get("settle", 0.0)))
+	for st in structs:
+		st.settle = sag * _sag_direction(st)
+
+
+## A random side, unless that would run the player out of room to answer it.
+func _sag_direction(st: Structure) -> float:
+	var dir := 1.0 if randf() < 0.5 else -1.0
+	return dir if st.capacity(-dir) >= st.capacity(dir) * 0.35 else -dir
+
+
+func _fire(ev: Dictionary) -> void:
+	var st: Structure = structs[int(ev.get("s", 0))]
+	var say := ""
+	match ev["e"]:
+		"tremor":
+			say = "TREMOR!"
+			var dir := _sag_direction(st)
+			var mag := minf(float(ev["mag"]), rad_to_deg(st.capacity(-dir) * 0.7 / st.stiff))
+			st.kick(dir, mag)
+			shake = 4.0
+			_dust(pivots[int(ev.get("s", 0))], 24)
+		"gust":
+			say = "GALE!"
+			gust = 1.6 if randf() < 0.5 else -1.6
+		"add":
+			say = "ADDED!"
+			st.add_item(ev["item"])
+		"swing":
+			for it in st.items:
+				if it["kind"] == "load":
+					it["phi_v"] += float(ev["v"]) * (1.0 if randf() < 0.5 else -1.0)
+		"load":
+			for it in st.items:
+				if it["kind"] == "load":
+					it["m"] = maxf(4.0, float(it["m"]) + float(ev["dm"]))
+		"leak":
+			say = "LEAK!"
+			for it in st.items:
+				if it["kind"] == "tank":
+					it["leak"] = 0.0
+			st.items[int(ev["i"])]["leak"] = float(ev["rate"])
+			st.items[int(ev["i"])]["leak_left"] = float(ev.get("amount", 5.0))
+		"train":
+			for car in ev["cars"]:
+				var dir := float(car["dir"])
+				var start := -dir * (150.0 + float(car.get("lead", 0.0)))
+				st.add_item({"kind": "train", "m": car["m"], "y": 122.0, "x": start, "speed": dir * float(car["speed"])})
+			say = "TRAIN >>>" if float(ev["cars"][0]["dir"]) > 0.0 else "<<< TRAIN"
+	say = str(ev.get("say", say))
+	if not say.is_empty():
+		banner = say
+		banner_t = 0.0
+
+
+func _run_timed(dt: float) -> void:
+	var list: Array = level.get("timed", [])
+	for i in list.size():
+		timers[i] -= dt
+		if timers[i] <= 0.0:
+			timers[i] = float(list[i]["every"]) * randf_range(0.8, 1.2)
+			_fire(list[i])
 
 
 func _show_structures(on: bool) -> void:
@@ -282,7 +378,7 @@ func _process(delta: float) -> void:
 		State.TRAVEL:
 			travel_t += delta
 			if travel_t >= TRAVEL_TIME:
-				_build_level(travel_to, 0)
+				_build_level(travel_to, _resume_level(travel_to))
 				_show_structures(true)
 				state = State.CARD
 		State.PLAY, State.CLEAR, State.CARD, State.TITLE:
@@ -310,37 +406,51 @@ func _process(delta: float) -> void:
 
 func _phys_step(dt: float) -> void:
 	level_t += dt
+	var active := state == State.PLAY
+	if active:
+		_run_timed(dt)
 	if level.get("gusts", false) and state == State.PLAY:
 		gust_timer -= dt
 		if gust_timer <= 0.0:
 			gust = randf_range(0.6, 1.0) * (1.0 if randf() < 0.5 else -1.0)
-			gust_timer = randf_range(3.5, 5.5)
-		gust = move_toward(gust, 0.0, dt * 1.4)
+			gust_timer = randf_range(5.5, 9.0)
+	# Outside the if: a "gust" event can also fire in a level with no regular gusts.
+	gust = move_toward(gust, 0.0, dt * 1.4)
 	for i in structs.size():
 		var st: Structure = structs[i]
 		var ext := 0.0
 		if level.has("waves"):
 			ext += st.wave_amp * (sin(WAVE_W * level_t) + 0.5 * sin(WAVE_W * 1.7 * level_t + 1.3))
-		ext += gust * st.stiff * 0.07
+		ext += gust * st.stiff * float(level.get("gust_k", GUST_K))
 		if level.has("couple") and structs.size() == 2:
 			var other: Structure = structs[1 - i]
 			ext += float(level["couple"]) * minf(st.stiff, other.stiff) * (other.theta - st.theta)
 		st.ext_torque = ext
 	for st in structs:
-		st.step(dt)
+		st.step(dt, active)
+		st.drop_finished_trains()
 	if state != State.PLAY:
 		return
 	var band := deg_to_rad(float(level.get("band", DEFAULT_BAND)))
+	var still := float(level.get("still", DEFAULT_STILL))
 	var calm := true
 	for st in structs:
-		if absf(st.theta) > band:
+		if absf(st.theta) > band or st.has_trains():
 			calm = false
-		elif not level.has("waves") and absf(rad_to_deg(st.omega)) > 1.5:
+		elif not level.has("waves") and absf(rad_to_deg(st.omega)) > still:
 			calm = false
-	hold = hold + dt if calm else maxf(0.0, hold - dt * 3.0)
+	hold = hold + dt if calm else maxf(0.0, hold - dt * 1.5)
 	if hold >= float(level.get("hold", DEFAULT_HOLD)):
-		_clear()
+		_next_stage()
 		return
+	# Out of moves and it has come to rest crooked: nothing can save it now.
+	if moves_left == 0 and drag.is_empty() and not calm:
+		out_of_moves_t += dt
+		if out_of_moves_t >= OUT_OF_MOVES_WAIT:
+			_fail(_worst_index())
+			return
+	else:
+		out_of_moves_t = 0.0
 	var fail := deg_to_rad(float(level.get("fail", DEFAULT_FAIL)))
 	for i in structs.size():
 		if absf(structs[i].theta) > fail:
@@ -438,6 +548,14 @@ func _bridge_ends() -> Array:
 	return [_world_point(0, a), _world_point(1, Vector2(-b.x, b.y))]
 
 
+func _worst_index() -> int:
+	var worst := 0
+	for i in structs.size():
+		if absf(structs[i].theta) > absf(structs[worst].theta):
+			worst = i
+	return worst
+
+
 func _worst_tilt() -> float:
 	var worst := 0.0
 	for st in structs:
@@ -455,8 +573,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			if mb.pressed:
 				_press(get_local_mouse_position())
 			else:
-				drag = {}
-				_end_pump()
+				_release()
 		elif mb.button_index == MOUSE_BUTTON_RIGHT and mb.pressed and state in [State.PLAY, State.FAILED]:
 			_restart()
 		return
@@ -474,8 +591,7 @@ func _unhandled_input(event: InputEvent) -> void:
 					get_tree().quit()
 				elif state != State.TRAVEL:
 					state = State.MAP
-					drag = {}
-					_end_pump()
+					_release()
 					_show_structures(false)
 			KEY_ENTER, KEY_KP_ENTER, KEY_SPACE:
 				if state != State.PLAY and state != State.MAP:
@@ -510,11 +626,24 @@ func _press(m: Vector2) -> void:
 			touched = true
 			var st: Structure = structs[h["s"]]
 			var it: Dictionary = st.items[h["i"]]
-			if it["kind"] == "tank":
+			if it["kind"] == "tank" or it["kind"] == "winch":
 				st.pumping = h["i"]
 				drag = {"s": h["s"], "i": h["i"]}
-			else:
-				drag = {"s": h["s"], "i": h["i"], "off": float(it["x"]) - _to_local(h["s"], m).x}
+			elif moves_left != 0:
+				drag = {"s": h["s"], "i": h["i"], "off": float(it["x"]) - _to_local(h["s"], m).x, "start": float(it["tx"])}
+
+
+## Letting go: a free item stops where it is, a notched one finishes its move.
+func _release() -> void:
+	if drag.has("off"):
+		var it: Dictionary = structs[drag["s"]].items[drag["i"]]
+		if float(it.get("notch", 0.0)) > 0.0:
+			if moves_left > 0 and absf(float(it["tx"]) - float(drag["start"])) > 0.01:
+				moves_left -= 1
+		else:
+			it["tx"] = it["x"]
+	drag = {}
+	_end_pump()
 
 
 func _end_pump() -> void:
@@ -535,7 +664,11 @@ func _hit(m: Vector2) -> Dictionary:
 func _drag_to(m: Vector2) -> void:
 	var st: Structure = structs[drag["s"]]
 	var it: Dictionary = st.items[drag["i"]]
-	it["x"] = clampf(_to_local(drag["s"], m).x + float(drag["off"]), it["min"], it["max"])
+	var target := clampf(_to_local(drag["s"], m).x + float(drag["off"]), it["min"], it["max"])
+	var notch := float(it.get("notch", 0.0))
+	if notch > 0.0:
+		target = clampf(snappedf(target, notch), it["min"], it["max"])
+	it["tx"] = target
 
 
 func _update_hover() -> void:
@@ -607,11 +740,16 @@ func _draw_world(c: CanvasItem) -> void:
 		for gx in range(0, 480, 7):
 			c.draw_rect(Rect2(gx + (gx * 13) % 5, GROUND_Y - 1, 2 + gx % 3, 1), Pal.MID)
 
+	if structs[0].type == "pier":
+		_draw_embankments(c)
+
 	# Crane loads hang in world space, below the jib tip.
 	for i in structs.size():
 		if i == collapse_i and landed:
 			continue
 		for it in structs[i].items:
+			if it["kind"] == "train":
+				_draw_train(c, i, it)
 			if it["kind"] == "load":
 				var hook := _world_point(i, Vector2(it["x"], it["y"] - 3.0))
 				var weight_pos := hook + Vector2(sin(it["phi"]), cos(it["phi"])) * float(it["len"])
@@ -671,6 +809,34 @@ func _draw_world(c: CanvasItem) -> void:
 			var x := randf_range(0, 480)
 			c.draw_rect(Rect2(x, y, 10 + randf() * 14, 1), Color(Pal.PALE, absf(gust) * 0.6))
 	_draw_particles(c)
+
+
+## The valley sides the viaduct's rails run out onto.
+func _draw_embankments(c: CanvasItem) -> void:
+	var top := GROUND_Y - 120.0
+	var cx: float = pivots[0].x
+	var left := cx - Structure.DECK_HW
+	var right := cx + Structure.DECK_HW
+	for r: Rect2 in [Rect2(0, top, left, GROUND_Y - top), Rect2(right, top, 480 - right, GROUND_Y - top)]:
+		c.draw_rect(r, Pal.GRID)
+		c.draw_rect(Rect2(r.position, Vector2(r.size.x, 1)), Pal.PALE)
+		c.draw_rect(Rect2(r.position + Vector2(0, 1), Vector2(r.size.x, 6)), Pal.INK)
+
+
+func _draw_train(c: CanvasItem, i: int, it: Dictionary) -> void:
+	var p := _world_point(i, Vector2(float(it["x"]), float(it["y"]))).round()
+	var back := -signf(float(it["speed"]))
+	# Engine and cars; heavier trains are longer.
+	var cars := 1 + int(float(it["m"]) / 8.0)
+	for k in cars:
+		var cx := p.x + back * k * 16.0
+		c.draw_rect(Rect2(cx - 7, p.y - 9, 14, 8), Pal.MAIN if k == 0 else Pal.MID)
+		c.draw_rect(Rect2(cx - 7, p.y - 9, 14, 1), Pal.PALE)
+		c.draw_rect(Rect2(cx - 5, p.y - 1, 3, 2), Pal.DEEP)
+		c.draw_rect(Rect2(cx + 2, p.y - 1, 3, 2), Pal.DEEP)
+	c.draw_rect(Rect2(p.x - back * 4 - 1, p.y - 13, 3, 4), Pal.LIGHT)
+	if randf() < 0.3:
+		particles.append({"p": p + Vector2(-back * 4, -14), "v": Vector2(back * 18.0, -14), "life": 0.8, "c": Pal.MID, "g": -4.0})
 
 
 func _draw_sea(c: CanvasItem) -> void:
@@ -745,6 +911,8 @@ func _draw_hud(c: CanvasItem) -> void:
 	_frame(c, box, Pal.WHITE if straight else Pal.LIGHT)
 	_frame(c, box.grow(-2), Color(Pal.DEEP, 0.8))
 	PixelFont.draw(c, "TILT", box.position + Vector2(7, 6), Pal.LIGHT)
+	if absf(tilt) >= 0.005:
+		PixelFont.draw_right(c, "<<" if tilt < 0.0 else ">>", box.end.x - 7, box.position.y + 6, Pal.LIGHT)
 	var col := Pal.WHITE if straight else Pal.PALE
 	if absf(tilt) > float(level.get("fail", DEFAULT_FAIL)) * 0.7 and _blink(5.0):
 		col = Pal.WARN
@@ -753,6 +921,13 @@ func _draw_hud(c: CanvasItem) -> void:
 	c.draw_rect(Rect2(10, 57, 120, 2), Pal.INK)
 	if frac > 0.0:
 		c.draw_rect(Rect2(10, 57, 120 * frac, 2), Pal.WHITE)
+	# One pip per hold this level asks for; events strike between them.
+	var stages: int = (level.get("events", []) as Array).size() + 1
+	if stages > 1:
+		for k in stages:
+			c.draw_rect(Rect2(10 + k * 7, 62, 5, 3), Pal.PALE if k < stage else (Pal.MID if k == stage else Pal.INK))
+	if moves_left >= 0:
+		PixelFont.draw(c, "MOVES %d" % moves_left, Vector2(10, 62), Pal.WARN if moves_left == 0 else Pal.PALE)
 
 	var town: Dictionary = Towns.TOWNS[town_i]
 	PixelFont.draw_right(c, town["name"], 470, 10, Pal.MAIN, 2)
@@ -842,6 +1017,22 @@ func _draw_icon(c: CanvasItem, icon: String, base: Vector2, s: int, col: Color) 
 			r.call(-8, 0, 5, 15)
 			r.call(4, 0, 5, 15)
 			r.call(-3, 10, 7, 1)
+		"clock":
+			r.call(-4, 0, 9, 13)
+			r.call(-3, 13, 7, 2)
+			r.call(-1, 15, 3, 2)
+		"viaduct":
+			r.call(-10, 11, 21, 2)
+			r.call(-2, 0, 5, 11)
+			r.call(-7, 13, 9, 3)
+		"mast":
+			r.call(0, 0, 1, 17)
+			for k in 3:
+				r.call(-3 + k, k * 6, 7 - k * 2, 1)
+		"meridian":
+			r.call(0, 0, 1, 17)
+			r.call(-7, 8, 15, 1)
+			r.call(-2, 3, 5, 2)
 
 
 func _draw_travel(c: CanvasItem) -> void:
@@ -902,10 +1093,15 @@ func _draw_end(c: CanvasItem) -> void:
 func _load_progress() -> void:
 	var cfg := ConfigFile.new()
 	if cfg.load(SAVE_PATH) == OK:
-		unlocked = clampi(int(cfg.get_value("progress", "unlocked", 1)), 1, Towns.TOWNS.size())
+		unlocked = clampi(int(cfg.get_value("journey", "unlocked", 1)), 1, Towns.TOWNS.size())
+		progress = cfg.get_value("journey", "levels", [])
+	progress.resize(Towns.TOWNS.size())
+	for t in progress.size():
+		progress[t] = int(progress[t]) if progress[t] != null else 0
 
 
 func _save_progress() -> void:
 	var cfg := ConfigFile.new()
-	cfg.set_value("progress", "unlocked", unlocked)
+	cfg.set_value("journey", "unlocked", unlocked)
+	cfg.set_value("journey", "levels", progress)
 	cfg.save(SAVE_PATH)
